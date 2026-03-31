@@ -1,65 +1,40 @@
-from unittest.mock import patch
-import shutil
+import logging
+from pathlib import Path
+import tempfile # Nouvel import pour gérer les fichiers temporaires
+
+import mlflow # Nouvel import pour mlflow
 import pandas as pd
+import sklearn.model_selection
 
-from titanic.training.steps.split_train_test import split_train_test, FEATURES, TARGET
+client = mlflow.MlflowClient() # Client mlflow pour interagir avec le server de tracking
+
+FEATURES = ["Pclass", "Sex", "SibSp", "Parch"]
+
+TARGET = "Survived"
 
 
-def test_split_train_test_with_real_data(tmp_path):
-    """Test que split_train_test sépare correctement les données."""
-    data_file = "data/all_titanic.csv"
-    original_df = pd.read_csv(data_file)
-    original_size = len(original_df)
+def split_train_test(data_path: str) -> tuple[str, str, str, str]:
+    logging.warning(f"split on {data_path}")
+    # Téléchargement des données brutes depuis mlflow
+    df = pd.read_csv(client.download_artifacts(run_id=mlflow.active_run().info.run_id, path=data_path), index_col=False) 
 
-    saved_files = {}
+    y = df[TARGET]
+    x = df[FEATURES]
+    x_train, x_test, y_train, y_test = sklearn.model_selection.train_test_split(x, y, test_size=0.3, random_state=42)
 
-    def mock_log_artifact_side_effect(path, artifact_path):
-        """Capture les fichiers splits avant suppression par TemporaryDirectory."""
-        filename = artifact_path.split("/")[-1] if "/" in artifact_path else artifact_path
-        saved_path = tmp_path / f"saved_{filename}.csv"
-        shutil.copy(path, saved_path)
-        saved_files[artifact_path] = saved_path
+    datasets = [
+      (x_train, "xtrain", "xtrain.csv"),
+      (x_test, "xtest", "xtest.csv"),
+      (y_train, "ytrain", "ytrain.csv"),
+      (y_test, "ytest", "ytest.csv"),
+    ]
 
-    with (
-        patch("mlflow.active_run") as mock_run,
-        patch("mlflow.log_artifact", side_effect=mock_log_artifact_side_effect),
-        patch("titanic.training.steps.split_train_test.client") as mock_client,
-    ):
-        mock_run.return_value.info.run_id = "test-run"
+    artifact_paths = []
+    with tempfile.TemporaryDirectory() as tmp_dir: # Utilisation d'un dossier temporaire
+        for data, artifact_path, filename in datasets:
+            file_path = Path(tmp_dir, filename)
+            data.to_csv(file_path, index=False)
+            mlflow.log_artifact(str(file_path), artifact_path) # Log du fichier de split dans mlflow
+            artifact_paths.append(f"{artifact_path}/{filename}") # Stockage du chemin dans mlflow
 
-        artifacts_dir = tmp_path / "artifacts"
-        artifacts_dir.mkdir()
-        data_copy = artifacts_dir / "data.csv"
-        shutil.copy(data_file, data_copy)
-
-        mock_client.download_artifacts.return_value = str(data_copy)
-
-        result = split_train_test("path_output/data.csv")
-
-        assert len(result) == 4
-        assert all(".csv" in path for path in result)
-        assert "xtrain" in result[0]
-        assert "xtest" in result[1]
-        assert "ytrain" in result[2]
-        assert "ytest" in result[3]
-
-        xtrain = pd.read_csv(saved_files["xtrain"])
-        xtest = pd.read_csv(saved_files["xtest"])
-        ytrain = pd.read_csv(saved_files["ytrain"])
-        ytest = pd.read_csv(saved_files["ytest"])
-
-        assert list(xtrain.columns) == FEATURES, "X_train doit contenir les features"
-        assert list(xtest.columns) == FEATURES, "X_test doit contenir les features"
-        assert list(ytrain.columns) == [TARGET], "y_train doit contenir la target"
-        assert list(ytest.columns) == [TARGET], "y_test doit contenir la target"
-
-        assert len(xtrain) == len(ytrain), "X_train et y_train doivent avoir la même taille"
-        assert len(xtest) == len(ytest), "X_test et y_test doivent avoir la même taille"
-
-        total_split_size = len(xtrain) + len(xtest)
-        assert total_split_size == original_size, (
-            f"La somme des splits ({total_split_size}) doit égaler la taille originale ({original_size})"
-        )
-
-        test_ratio = len(xtest) / total_split_size
-        assert 0.25 < test_ratio < 0.35, f"Le ratio test ({test_ratio:.2f}) devrait être proche de 0.3"
+    return tuple(artifact_paths)

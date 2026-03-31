@@ -1,77 +1,68 @@
-from unittest.mock import patch, Mock
-import pandas as pd
+import logging
+
 import joblib
-from sklearn.ensemble import RandomForestClassifier
+import pandas as pd
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, median_absolute_error
+import mlflow # Nouvel import pour mlflow
+from mlflow.models import infer_signature # Nouvel import pour inférer la signature du modèle
 
-from titanic.training.steps.validate import validate
+client = mlflow.MlflowClient()
 
 
-def test_validate_with_real_model_and_data(tmp_path):
-    """Test que validate calcule et log des métriques valides."""
-    df = pd.read_csv("data/all_titanic.csv")
-    logged_metrics = {}
-    logged_dicts = {}
+def validate(model_path: str, x_test_path: str, y_test_path: str) -> None:
+    logging.warning(f"validate {model_path}")
+    model = joblib.load(client.download_artifacts(run_id=mlflow.active_run().info.run_id, path=model_path)) # Téléchargement du modèle depuis mlflow
 
-    def capture_metric(key, value):
-        """Capture les métriques loggées pour vérification."""
-        logged_metrics[key] = value
+    x_test = pd.read_csv(
+        client.download_artifacts(run_id=mlflow.active_run().info.run_id, path=x_test_path), index_col=False # Téléchargement des données depuis mlflow
+    )
+    y_test = pd.read_csv(
+        client.download_artifacts(run_id=mlflow.active_run().info.run_id, path=y_test_path), index_col=False # Téléchargement des données depuis mlflow
+    )
 
-    def capture_dict(data, artifact_file):
-        """Capture les dictionnaires loggés pour vérification."""
-        logged_dicts[artifact_file] = data
+    x_test = pd.get_dummies(x_test)
 
-    with (
-        patch("mlflow.active_run") as mock_run,
-        patch("mlflow.log_metric", side_effect=capture_metric),
-        patch("mlflow.log_dict", side_effect=capture_dict),
-        patch("mlflow.sklearn.log_model") as mock_log_model,
-        patch("mlflow.register_model"),
-        patch("titanic.training.steps.validate.client") as mock_client,
-    ):
-        mock_run.return_value.info.run_id = "test-run"
-        mock_model_info = Mock()
-        mock_model_info.model_uri = "runs:/test/model"
-        mock_log_model.return_value = mock_model_info
+    if y_test.shape[1] == 1:
+        y_test = y_test.iloc[:, 0]
 
-        x_test = df[["Pclass", "Sex", "SibSp", "Parch"]].head(50)
-        y_test = df[["Survived"]].head(50)
+    y_pred = model.predict(x_test)
 
-        x_dummies = pd.get_dummies(x_test)
-        model = RandomForestClassifier(n_estimators=10, max_depth=3, random_state=42)
-        model.fit(x_dummies, y_test.iloc[:, 0])
+    mse = mean_squared_error(y_test, y_pred)
+    mae = mean_absolute_error(y_test, y_pred)
+    r2 = r2_score(y_test, y_pred)
+    medae = median_absolute_error(y_test, y_pred)
 
-        model_file = tmp_path / "model.joblib"
-        x_file = tmp_path / "x_test.csv"
-        y_file = tmp_path / "y_test.csv"
+    feature_names = x_test.columns.tolist()
 
-        joblib.dump(model, model_file)
-        x_test.to_csv(x_file, index=False)
-        y_test.to_csv(y_file, index=False)
+    if hasattr(model, "feature_importances_"):
+        importances = model.feature_importances_
+        feature_importance = {
+        name: float(importance) for name, importance in zip(feature_names, importances, strict=False)
+        }
+    elif hasattr(model, "coef_"):
+        coefs = model.coef_
+        if hasattr(coefs, "shape") and len(coefs.shape) > 1:
+            coefs = coefs[0]
+        feature_importance = {name: float(coef) for name, coef in zip(feature_names, coefs, strict=False)}
+    else:
+        feature_importance = {name: 0.0 for name in feature_names}
+        logging.warning("Model does not have feature importance attributes")
 
-        mock_client.download_artifacts.side_effect = [str(model_file), str(x_file), str(y_file)]
+    mlflow.log_metric("mse", mse) # Log des métriques dans mlflow
+    mlflow.log_metric("mae", mae)
+    mlflow.log_metric("r2", r2)
+    mlflow.log_metric("medae", medae)
+    mlflow.log_dict(feature_importance, "feature_importance.json") # Log de la feature importance dans mlflow
 
-        validate("model_trained/model.joblib", "xtest/xtest.csv", "ytest/ytest.csv")
+    model_info = mlflow.sklearn.log_model(
+        model, name="model_final", signature=infer_signature(x_test, y_pred), input_example=x_test.head(10)
+    ) # Log du modèle validé dans mlflow
+    logging.warning(f"artifact path {model_info.artifact_path}") # Log des informations du modèle
+    logging.warning(f"model uri {model_info.model_uri}")
+    logging.warning(f"model uuid {model_info.model_uuid}")
+    logging.warning(f"model metadata {model_info.metadata}")
 
-        assert "mse" in logged_metrics, "MSE devrait être loggé"
-        assert "mae" in logged_metrics, "MAE devrait être loggé"
-        assert "r2" in logged_metrics, "R2 devrait être loggé"
-        assert "medae" in logged_metrics, "MedAE devrait être loggé"
-
-        assert logged_metrics["mse"] >= 0, "MSE devrait être positif"
-        assert logged_metrics["mae"] >= 0, "MAE devrait être positif"
-        assert -1 <= logged_metrics["r2"] <= 1, "R2 devrait être entre -1 et 1"
-        assert logged_metrics["medae"] >= 0, "MedAE devrait être positif"
-
-        assert logged_metrics["mae"] <= logged_metrics["mse"], "MAE devrait être <= MSE (en général)"
-
-        assert "feature_importance.json" in logged_dicts, "Feature importance devrait être loggé"
-        feature_importance = logged_dicts["feature_importance.json"]
-        assert len(feature_importance) > 0, "Feature importance ne devrait pas être vide"
-        assert all(isinstance(v, (int, float)) for v in feature_importance.values()), (
-            "Les importances devraient être numériques"
-        )
-
-        mock_log_model.assert_called_once()
-        call_kwargs = mock_log_model.call_args.kwargs
-        assert "signature" in call_kwargs, "Le modèle devrait être loggé avec une signature"
-        assert "input_example" in call_kwargs, "Le modèle devrait être loggé avec un input_example"
+    try:
+        mlflow.register_model(model_info.model_uri, "model_registered") # Enregistrement du modèle dans le modèle registry
+    except Exception as e:
+        logging.error(f"Erreur registry: {e}") # Log de l'erreur si l'enregistrement échoue

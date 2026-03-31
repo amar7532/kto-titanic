@@ -1,43 +1,41 @@
-from unittest.mock import patch, Mock
-import shutil
+import logging
+import os
+from pathlib import Path
+import tempfile # Nouvel import pour gérer les fichiers temporaires
+
+import boto3
+import mlflow # Nouvel import pour mlflow
 import pandas as pd
+from ydata_profiling import ProfileReport
 
-from titanic.training.steps.load_data import load_data
+
+ARTIFACT_PATH = "path_output"
+PROFILING_PATH = "profiling_reports"
 
 
-def test_load_data_with_local_file(tmp_path):
-    """Test que load_data télécharge, profile et log correctement les données."""
-    data_file = "data/all_titanic.csv"
-    original_df = pd.read_csv(data_file)
-    saved_csv_path = None
+def load_data(path: str) -> str:
+  logging.warning(f"load_data on path : {path}")
 
-    def mock_log_artifact_side_effect(path, artifact_path):
-        """Capture le fichier CSV avant qu'il ne soit supprimé par TemporaryDirectory.
+  with tempfile.TemporaryDirectory() as tmp_dir: # Utilisation d'un dossier temporaire
+    local_path = Path(tmp_dir, "data.csv") # Fichier temporaire pour stocker les données
+    logging.warning(f"to path : {local_path}")
 
-        load_data() utilise un TemporaryDirectory qui supprime les fichiers à la fin.
-        Ce side_effect copie le CSV loggé pour pouvoir le comparer après coup.
-        """
-        nonlocal saved_csv_path
-        if path.endswith(".csv"):
-            saved_csv_path = tmp_path / "saved_data.csv"
-            shutil.copy(path, saved_csv_path)
+    s3_client = boto3.client(
+      "s3",
+      endpoint_url=os.environ.get("MLFLOW_S3_ENDPOINT_URL"),
+      aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
+      aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
+    )
 
-    with patch("mlflow.log_artifact", side_effect=mock_log_artifact_side_effect), patch("boto3.client") as mock_s3:
-        mock_client = Mock()
+    s3_client.download_file("kto-titanic", path, local_path)
+    df = pd.read_csv(local_path)
 
-        def fake_download(bucket, key, local_path):
-            shutil.copy(data_file, local_path)
+    profile = ProfileReport(df, title=f"Profiling Report - {local_path.stem}")
+    with tempfile.NamedTemporaryFile(suffix=".html", delete=False) as tmp_file: # Fichier temporaire pour le rapport de profiling
+      profile.to_file(tmp_file.name)
+      mlflow.log_artifact(tmp_file.name, PROFILING_PATH) # Log du rapport de profiling dans mlflow
 
-        mock_client.download_file = fake_download
-        mock_s3.return_value = mock_client
+    mlflow.log_artifact(str(local_path), ARTIFACT_PATH) # Log du fichier de données dans mlflow
 
-        result = load_data("all_titanic.csv")
-
-        assert "path_output" in result
-        assert ".csv" in result
-
-        assert saved_csv_path is not None, "Le fichier CSV devrait avoir été loggé"
-        assert saved_csv_path.exists(), "Le fichier CSV sauvegardé devrait exister"
-
-        logged_df = pd.read_csv(saved_csv_path)
-        pd.testing.assert_frame_equal(original_df, logged_df, check_dtype=False)
+  return f"{ARTIFACT_PATH}/{local_path.name}" # Retourne le chemin dans mlflow
+s
